@@ -3,6 +3,7 @@
 #include <random>
 #include <tuple>
 #include <vector>
+#include <chrono>
 
 using namespace std;
 
@@ -25,7 +26,7 @@ class CIRmethods {
         pair<tuple<double, double, double>, tuple<double, double, double> >
             refine(double, double, double, double);
 
-        double alfonsi(double, double, double);
+        double implicit_euler(double, double, double);
 
         double linear_ode_step(double, double, double);
 
@@ -38,6 +39,9 @@ class CIRmethods {
         pair<double, double> variable_ode_step
             (pair<double, double>, double, double,
              int, int, double, double, double);
+
+        double variable_ode_step_test
+            (double, double, double, int, double, double, double);
 
     private:
         // Precomputed values that depend on the input parameters
@@ -82,8 +86,8 @@ class CIRmethods {
 };
 
 // Constructor will initialize the above private variables
-CIRmethods::CIRmethods(double input_a, double input_b,
-                       double input_sigma, double input_stepsize_control){
+CIRmethods::CIRmethods(double input_a, double input_b, double input_sigma,
+                       double input_stepsize_control){
 
     a = input_a;
     b = input_b;
@@ -142,13 +146,13 @@ pair<tuple<double, double, double>, tuple<double, double, double> >
 };
 
 /*
-    One step of the best performing method detailed in the paper:
+    One step of the drift-implicit Euler method detailed in the paper:
 
     A. Alfonsi, On the discretization schemes for the CIR
     (and Bessel squared) processes, Monte Carlo Methods
     and Applications, Volume 11, 2005.
 */
-double CIRmethods::alfonsi(double sqrt_y, double h, double brownian_increment){
+double CIRmethods::implicit_euler(double sqrt_y, double h, double brownian_increment){
 
     double additive_noise = sqrt_y + half_sigma*brownian_increment;
 
@@ -352,6 +356,63 @@ pair<double, double>
     return sqrt_ys;
 };
 
+// Method for propagating the numerical solution a given
+// time interval using a variable step size methodology
+// (this is for the speed test and does not compare methods)
+double CIRmethods::variable_ode_step_test(double sqrt_y,
+                                          double h, double sqrt_h,
+                                          int crude_sub_divide_no,
+                                          double brownian_increment,
+                                          double brownian_area,
+                                          double brownian_sign){
+
+    // Variable step size condition for controlling the local L2(P) error.
+    // Note that crude_sub_divide_no is to ensure the recursion will stop.
+    if ((pow(h,2)*(eleven_over_two_five_two*h \
+                    + increment_squared_coeff*pow(brownian_increment, 2) \
+                    + area_squared_coeff*pow(brownian_area, 2) \
+                    + sign_coeff*brownian_sign*sqrt_h*brownian_increment) \
+                        < rescaled_control*pow(sqrt_y, 4))
+        || (crude_sub_divide_no == 0)){
+
+        // Propagate the pair of numerical solutions.
+        // Note sqrt_ys.first is the "crude" approximation
+        // and sqrt_ys.second is the "fine" approximation.
+        // The fine step size is h * 2^(-fine_sub_divide_no).
+        sqrt_y = zigzag_ode_step(sqrt_y, h, sqrt_h,
+                                            brownian_increment,
+                                            brownian_area,
+                                            brownian_sign);
+
+        step_counter = step_counter + 1;
+    }
+    else {
+        // If the condition fails, then we will half the step size
+        double half_h = 0.5*h;
+        double half_sqrt_h = root_half*sqrt_h;
+
+        // Generate the Brownian path over the two half intervals
+        pair<tuple<double, double, double>, tuple<double, double, double> >
+            refined_bm = refine(sqrt_h, brownian_increment,
+                                brownian_area, brownian_sign);
+
+        // Compute numerical solution over the first half interval
+        sqrt_y = variable_ode_step_test(sqrt_y, half_h, half_sqrt_h,
+                                        crude_sub_divide_no - 1,
+                                        get<0>(refined_bm.first),
+                                        get<1>(refined_bm.first),
+                                        get<2>(refined_bm.first));
+
+        // Compute numerical solution over the second half interval
+        sqrt_y = variable_ode_step_test(sqrt_y, half_h, half_sqrt_h,
+                                        crude_sub_divide_no - 1,
+                                        get<0>(refined_bm.second),
+                                        get<1>(refined_bm.second),
+                                        get<2>(refined_bm.second));
+    }
+
+    return sqrt_y;
+};
 int main()
 {
     // Input parameters
@@ -360,7 +421,7 @@ int main()
     const double sigma = sqrt(3.0);
     const double y0 = 1.0;
     const double T = 1.0;
-    const double stepsize_control = 0.05;
+    const double stepsize_control = 0.0675;
 
     const double root_T = sqrt(T);
 
@@ -414,7 +475,7 @@ int main()
         brownian_area = big_area_distribution(generator);
 
         if (rademacher_distribution(generator)){
-            brownian_sign = -1.0;
+            brownian_sign = - brownian_sign;
         }
 
         // Propagate the numerical solution over the whole interval [0,T]
@@ -456,9 +517,9 @@ int main()
 
     average_no_of_steps = average_no_of_steps / (double(no_of_paths));
 
-    /*   We now estimate errors for the Alfonsi method   */
+    /*   We now estimate errors for the drift-implicit Euler method   */
 
-    // Number of crude steps used by the Alfonsi method
+    // Number of crude steps used by the drift-implicit Euler method
     const int no_of_steps = 100;
 
     // Number of steps used by the fine approximation
@@ -469,14 +530,14 @@ int main()
     const double step_size =  T/(double)no_of_steps;
     const double fine_step_size = T/(double)(no_of_steps*no_of_fine_steps);
 
-    // The Alfonsi method only using increments of the Brownian path
+    // The drift-implicit Euler method only using increments of the Brownian path
     double fine_brownian_increment = 0.0;
 
     // Numerical solutions computed with course and fine step sizes
-    double sqrt_y_afonsi = sqrt_y0;
+    double sqrt_y_euler = sqrt_y0;
     double sqrt_y_fine = sqrt_y0;
 
-    // Strong and weak error estimators for sqrt_y_afonsi at time T
+    // Strong and weak error estimators for sqrt_y_euler at time T
     double end_point_error_2 = 0.0;
     double call_option_error_2 = 0.0;
 
@@ -495,7 +556,7 @@ int main()
                 fine_brownian_increment = fine_increment_distribution(generator);
 
                 // Propagate the numerical solution over the fine increment
-                sqrt_y_fine = CIR_method.alfonsi(sqrt_y_fine, fine_step_size,
+                sqrt_y_fine = CIR_method.implicit_euler(sqrt_y_fine, fine_step_size,
                                                  fine_brownian_increment);
 
                 // Update the Brownian path using the recently generated variable.
@@ -503,27 +564,98 @@ int main()
             }
 
             // Propagate the numerical solution over the course increment
-            sqrt_y_afonsi = CIR_method.alfonsi(sqrt_y_afonsi, step_size,
+            sqrt_y_euler = CIR_method.implicit_euler(sqrt_y_euler, step_size,
                                                brownian_increment);
         }
 
         // Compute the L2 error between the methods on the fine and course scales
-        end_point_error_2 = end_point_error_2 + pow(pow(sqrt_y_afonsi,2) \
+        end_point_error_2 = end_point_error_2 + pow(pow(sqrt_y_euler,2) \
                                                     - pow(sqrt_y_fine, 2), 2);
 
         // Evaluate the call option payoffs
         call_option_error_2 = call_option_error_2 \
-                                + abs(max(0.0, pow(sqrt_y_afonsi,2) - b) \
+                                + abs(max(0.0, pow(sqrt_y_euler,2) - b) \
                                       - max(0.0, pow(sqrt_y_fine, 2) - b));
 
         // Reset the numerical solutions
-        sqrt_y_afonsi = sqrt_y0;
+        sqrt_y_euler = sqrt_y0;
         sqrt_y_fine = sqrt_y0;
     }
 
     // Compute the averages for estimating the strong and weak errors
     end_point_error_2 = sqrt(end_point_error_2 / (double(no_of_paths)));
     call_option_error_2 = call_option_error_2 / (double(no_of_paths));
+
+
+    // Parameters used for the speed test
+    const int no_of_paths_for_test = 100000;
+    const double stepsize_control_test = 0.0675;
+    const double sqrt_step_size = sqrt(step_size);
+    double sqrt_y = sqrt_y0;
+    double average_no_of_steps_test = 0.0;
+
+    CIRmethods CIR_test(a, b, sigma, stepsize_control_test);
+
+    // Start the speed test
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Run numerical method with a variable step size
+    for (int i=0; i < no_of_paths_for_test; i++){
+
+        // Generate information about the Brownian path over the whole interval
+        brownian_increment = big_increment_distribution(generator);
+        brownian_area = big_area_distribution(generator);
+
+        if (rademacher_distribution(generator)){
+            brownian_sign = - brownian_sign;
+        }
+
+        // Propagate the numerical solution over the whole interval [0,T]
+        sqrt_y = CIR_test.variable_ode_step_test(sqrt_y, T, root_T,
+                                                 max_no_crude_subdivisions,
+                                                 brownian_increment,
+                                                 brownian_area,
+                                                 brownian_sign);
+
+        // Record the number of steps used in the simulation
+        average_no_of_steps_test = average_no_of_steps_test \
+                                 + (double)CIR_test.step_counter;
+
+        // Reset the numerical solution
+        sqrt_y = sqrt_y0;
+        CIR_test.step_counter = 0;
+    }
+
+//    // Run numerical method with a fixed step size
+//    for (int i=0; i<no_of_paths_for_test; ++i) {
+//        for (int j=1; j<=no_of_steps; ++j) {
+//
+//            // Generate information about Brownian path
+//            brownian_increment = big_increment_distribution(generator);
+//            //brownian_area = big_area_distribution(generator);
+//
+//            //if (rademacher_distribution(generator)){
+//            //    brownian_sign = -brownian_sign;
+//            //}
+//
+//
+//            // Propagate the numerical solution over the course increment
+//            sqrt_y = CIR_test.implicit_euler(sqrt_y, step_size, brownian_increment);
+//            //sqrt_y = CIR_test.zigzag_ode_step(sqrt_y, step_size, sqrt_step_size, brownian_increment, brownian_area,
+//            //                                     brownian_sign);
+//
+//        }
+//         // Reset the numerical solution
+//        sqrt_y = sqrt_y0;
+//    }
+
+    // End the speed test
+    auto finish = std::chrono::high_resolution_clock::now();
+
+    // Obtain the time taken by the speed test
+    std::chrono::duration<double> elapsed = finish - start;
+
+    average_no_of_steps_test = average_no_of_steps_test / (double(no_of_paths_for_test));
 
     // Display the results in a text file
     ofstream myfile;
@@ -542,21 +674,28 @@ int main()
            << " for the ODE method: \t"  << std::setprecision(15)
            << abs(crude_call_price - fine_call_price) << "\n\n";
 
-    myfile << "Number of steps used by the Alfonsi method: " << "\t\t\t"
+    myfile << "Number of steps used by the drift-implicit Euler method: " << "\t\t"
            << no_of_steps << "\n";
 
     myfile << std::fixed << std::setprecision(2)
-           << "L2 error at time T = " << T << " for the Alfonsi method: \t\t"
+           << "L2 error at time T = " << T << " for the drift-implicit Euler method: \t\t"
            << std::setprecision(15) << end_point_error_2 << "\n";
 
     myfile << std::fixed << std::setprecision(2)
            << "Call option error at time T = " << T
-           << " for the Alfonsi method: \t"
+           << " for the drift-implicit Euler method: "
            << std::setprecision(15) << call_option_error_2 << "\n\n";
 
     myfile << std::fixed << std::setprecision(2) \
-           << "Call option value computed at time T = " << T << ": \t " \
+           << "Call option value computed at time T = " << T << ": \t" \
            << std::setprecision(15) << fine_call_price << "\n\n";
+
+    myfile << std::fixed << std::setprecision(10) \
+           << "Time taken in the speed test: " << "\t\t\t" << elapsed.count() << "\n\n";
+
+    myfile << std::fixed << std::setprecision(15)
+           << "Average number of steps used in the speed test: "
+           << average_no_of_steps_test << "\n\n";
 
     myfile << "Example sample path" << "\n\n" ;
 
